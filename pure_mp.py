@@ -3,14 +3,25 @@ import shutil
 import torch
 import random
 import multiprocessing as mp
+from typing import Iterable
 
 class OverComsumptionError(Exception):
     """Custom exception for overconsumption of the buffer."""
+    
+class DummyDataset(torch.utils.data.Dataset):
+    def __init__(self, data: torch.Tensor):
+        self.data = data
 
-class RBDS(torch.utils.data.Dataset):
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return self.data[index]
+
+class ReplayBufferWrapper(torch.utils.data.Dataset):
     def __init__(
         self,
-        data: torch.Tensor,
+        dataset: torch.utils.data.Dataset,
         num_steps: int,
         buffer: mp.Queue,
         buffer_samples: dict,
@@ -19,7 +30,7 @@ class RBDS(torch.utils.data.Dataset):
         wlock: mp.Lock,
         buffer_timeout: float=60 # i.e. 1 minutes
     ):
-        self.data = data
+        self.dataset = dataset
         self.num_steps = num_steps
         self.buffer = buffer
         self.buffer_samples = buffer_samples
@@ -31,7 +42,7 @@ class RBDS(torch.utils.data.Dataset):
     @classmethod
     def init_main_process(
         cls,
-        data: torch.Tensor,
+        dataset: torch.utils.data.Dataset,
         num_steps: int,
         buffer_size: int,
         cache_dir: str,
@@ -60,13 +71,13 @@ class RBDS(torch.utils.data.Dataset):
         
         # start the writer process
         writer = mp.Process(
-            target=RBDS._writer_process,
+            target=ReplayBufferWrapper._writer_process,
             args=(write_queue, buffer_samples, cache_dir, buffer_size)
         )
         writer.start()
         
         return writer, cls(
-            data=data,
+            dataset=dataset,
             num_steps=num_steps,
             buffer=buffer,
             buffer_samples=buffer_samples,
@@ -99,12 +110,12 @@ class RBDS(torch.utils.data.Dataset):
         if isinstance(index, torch.Tensor):
             index = index.detach().cpu().item()
         
-        if index >= len(self.data):
+        if index >= len(self.dataset):
             # If we unfortunately get an index that is out of bounds, we sample a fresh sample
             old_index = index
-            index = random.randint(0, len(self.data) - 1)
-            sample = self.data[index]
-            print(f"Index {old_index} is out of bounds for data of size {len(self.data)}. Sampled a new index {index} instead.")
+            index = random.randint(0, len(self.dataset) - 1)
+            sample = self.dataset[index]
+            print(f"Index {old_index} is out of bounds for data of size {len(self.dataset)}. Sampled a new index {index} instead.")
             
         sample = sample.detach().cpu()
         
@@ -148,13 +159,13 @@ class RBDS(torch.utils.data.Dataset):
                 
             # if the buffer_samples[index] is empty, get from data, otherwise from buffer_samples
             if self.buffer_samples[index].empty():
-                sample = self.data[index]
+                sample = self.dataset[index]
             else:
                 sample_path = self.buffer_samples[index].get(timeout=self.buffer_timeout)
                 sample = torch.load(sample_path)
                 os.remove(sample_path)
             
-            print(f"PID: {mp.current_process().pid} loaded item: {index}, sample: {sample.shape}, buffer size: {self.buffer.qsize()}")
+            # print(f"PID: {mp.current_process().pid} loaded item: {index}, sample: {sample.shape}, buffer size: {self.buffer.qsize()}")
             
         return index, sample
     
@@ -169,27 +180,27 @@ if __name__ == "__main__":
     print("Configuring ...")
     data = torch.zeros(5000, 3, 120, 61)
     cache_dir = os.path.join(os.getcwd(), "cache")
-    buffer_size = 2000
-    num_steps = 10000
+    buffer_size = 200
+    num_steps = 1000
     batch_size = 2
     buffer_timeout = 10
         
     num_steps_per_worker = num_steps * batch_size
     
     print("Creating dataloader...")
-    # dataloader, writer = get_dataloader(data, cache_dir, buffer_size, num_steps, buffer_timeout)
-    writer, dataset = RBDS.init_main_process(
-        data=data,
+    dataset = DummyDataset(data)
+    writer, rb_wrapper = ReplayBufferWrapper.init_main_process(
+        dataset=dataset,
         num_steps=num_steps_per_worker,
         buffer_size=buffer_size,
         cache_dir=cache_dir,
         buffer_timeout=buffer_timeout
     )
     dataloader = torch.utils.data.DataLoader(
-        dataset,
+        rb_wrapper,
         batch_size=batch_size,
         num_workers=12,
-        shuffle=False,
+        shuffle=False, # shuffle has no effect because we are using a buffer with random samples
         multiprocessing_context="forkserver"
     )
     
@@ -206,3 +217,4 @@ if __name__ == "__main__":
         
     print("Closing dataloader...")
     close_main_process(writer, dataloader, cache_dir)
+    print("Done.")
