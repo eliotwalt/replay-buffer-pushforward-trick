@@ -1,10 +1,35 @@
+import os
+import shutil
 import torch
 import random
 import multiprocessing as mp
-from multiprocessing import Manager
 
 class OverComsumptionError(Exception):
     """Custom exception for overconsumption of the buffer."""
+
+def writer_process(write_queue: mp.Queue, buffer_samples: dict, cache_dir: str, maxsize: int):
+    """Process that writes samples to the buffer's cache"""
+    os.makedirs(cache_dir, exist_ok=True)
+    make_path = lambda index: os.path.join(cache_dir, f"{index}_{torch.randint(0, 100000, ()).item()}.pt")
+    while True:
+        # Get whatever is in the write queue
+        item = write_queue.get()
+        if item == "STOP":
+            break
+        index, sample = item
+        
+        # Create a unique file path for the sample
+        file_path = make_path(index)
+        while os.path.exists(file_path):
+            file_path = make_path(index)
+            
+        # Save the sample to the file
+        torch.save(sample, file_path)
+        
+        # add index to buffer_samples' queue
+        if index not in buffer_samples:
+            buffer_samples[index] = mp.Queue(maxsize=maxsize)
+        buffer_samples[index].put(file_path)
 
 class RBDS(torch.utils.data.Dataset):
     def __init__(
@@ -12,20 +37,24 @@ class RBDS(torch.utils.data.Dataset):
         data: torch.Tensor,
         num_steps: int,
         buffer: mp.Queue,
-        buffer_samples: dict, # actually a manager.dict()
-        lock: mp.Lock,
+        buffer_samples: dict,
+        write_queue: mp.Queue,
+        rlock: mp.Lock,
+        wlock: mp.Lock,
         buffer_timeout: float=60 # i.e. 1 minutes
     ):
         self.data = data
         self.num_steps = num_steps
         self.buffer = buffer
         self.buffer_samples = buffer_samples
-        self.lock = lock
+        self.write_queue = write_queue
+        self.wlock = wlock
+        self.rlock = rlock
         self.buffer_timeout = buffer_timeout
             
     def add_to_buffer(self, index: int|torch.Tensor, sample: torch.Tensor, full_ok: bool=False):
         if isinstance(index, torch.Tensor):
-            index = index.item()
+            index = index.detach().cpu().item()
         
         if index >= len(self.data):
             # If we unfortunately get an index that is out of bounds, we sample a fresh sample
@@ -33,25 +62,29 @@ class RBDS(torch.utils.data.Dataset):
             index = random.randint(0, len(self.data) - 1)
             sample = self.data[index]
             print(f"Index {old_index} is out of bounds for data of size {len(self.data)}. Sampled a new index {index} instead.")
+            
+        sample = sample.detach().cpu()
         
-        with self.lock:
+        with self.wlock:
             if self.buffer.full():
                 if not full_ok:
                     raise Exception("Buffer is full and full_ok is False. Cannot add new sample.")
                 else:
-                    _ = self.buffer.get_nowait()
+                    # make space
+                    _index = self.buffer.get_nowait()
+                    _ = self.buffer_samples[_index].get()
             
             # add sample to buffer
             self.buffer.put(index)
             
-            # add sample to shared queue
-            self.buffer_samples[index].put(sample)
+            # write to cache
+            self.write_queue.put((index, sample))
             
     def __len__(self):
         return self.num_steps
     
     def __getitem__(self, *args, **kwargs):
-        with self.lock:                        
+        with self.rlock:                        
             # get index from buffer
             # we use a timeout because the dataloading workers might consume the buffer faster than we can fill it
             # when num_workers > batch_size
@@ -71,17 +104,28 @@ class RBDS(torch.utils.data.Dataset):
                 raise Exception(f"Index {index} (type: {type(index)}) not in buffer_samples")
                 
             # if the buffer_samples[index] is empty, get from data, otherwise from buffer_samples
-            sample = self.data[index] if self.buffer_samples[index].empty() else self.buffer_samples[index].get()
+            if self.buffer_samples[index].empty():
+                sample = self.data[index]
+            else:
+                sample_path = self.buffer_samples[index].get(timeout=self.buffer_timeout)
+                sample = torch.load(sample_path)
+                os.remove(sample_path)
             
             print(f"PID: {mp.current_process().pid} loaded item: {index}, sample: {sample.shape}, buffer size: {self.buffer.qsize()}")
             
         return index, sample
     
-def get_dataloader(data: torch.Tensor, buffer_size: int, num_steps: int, buffer_timeout: float=60):
+def get_dataloader(data: torch.Tensor, cache_dir: str, buffer_size: int, num_steps: int, buffer_timeout: float=60):
     manager = mp.Manager()
     buffer = manager.Queue(maxsize=buffer_size)
     buffer_samples = manager.dict()
-    lock = manager.Lock()
+    wlock = manager.Lock()
+    rlock = manager.Lock()
+    
+    # create a write queue for the writer process
+    write_queue = manager.Queue()
+    writer = mp.Process(target=writer_process, args=(write_queue, buffer_samples, cache_dir, len(data)))
+    writer.start()
     
     # calculate largest possible index that can be supervised by the dataset
     largest_index = len(data) - 1 # TODO: in true setting this is set by the forecast horizon scheduler
@@ -96,13 +140,15 @@ def get_dataloader(data: torch.Tensor, buffer_size: int, num_steps: int, buffer_
         buffer_samples[index] = manager.Queue(maxsize=len(data)) 
 
     # torch 
-    dataset = RBDS(data, num_steps, buffer, buffer_samples, lock, buffer_timeout)
-    return torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=12, shuffle=False, multiprocessing_context="forkserver")
+    dataset = RBDS(data=data, num_steps=num_steps, buffer=buffer, buffer_samples=buffer_samples, write_queue=write_queue, rlock=rlock, wlock=wlock, buffer_timeout=buffer_timeout)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=3, num_workers=12, shuffle=False, multiprocessing_context="forkserver")
+    return dataloader, writer
     
 if __name__ == "__main__":
     
     print("Configuring ...")
     data = torch.zeros(5000, 3, 120, 61)
+    cache_dir = os.path.join(os.getcwd(), "cache")
     buffer_size = 2000
     num_steps = 10000
     batch_size = 1
@@ -112,7 +158,7 @@ if __name__ == "__main__":
     
     
     print("Creating dataloader...")
-    dataloader = get_dataloader(data, buffer_size, num_steps, buffer_timeout)
+    dataloader, writer = get_dataloader(data, cache_dir, buffer_size, num_steps, buffer_timeout)
     
     print("Starting dataloader...")
     for i, (indexes, batch) in enumerate(dataloader):
@@ -124,3 +170,10 @@ if __name__ == "__main__":
         # add new samples to buffer
         for index, sample in zip(new_indexes, new_batch):
             dataloader.dataset.add_to_buffer(index.item(), sample, full_ok=True)    
+        
+    print("Stopping writer...")
+    dataloader.dataset.write_queue.put("STOP")
+    writer.join()
+    
+    shutil.rmtree(cache_dir)
+    print("Done.")
