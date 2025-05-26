@@ -23,8 +23,8 @@ class ReplayBufferWrapper(torch.utils.data.Dataset):
         buffer_size: int,
         write_queue: mp.Queue,
         sampling_strategy: str,  # or "age_based"
-        rlock: mp.Lock,
-        wlock: mp.Lock,
+        rlock: mp.Lock, # type: ignore
+        wlock: mp.Lock, # type: ignore
     ):
         self.dataset = dataset
         self.num_steps = num_steps
